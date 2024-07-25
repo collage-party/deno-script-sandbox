@@ -1,6 +1,30 @@
 import { Semaphore } from "https://deno.land/x/semaphore@v1.1.2/semaphore.ts";
 import { serve } from "https://deno.land/std@0.176.0/http/mod.ts";
-import { createScript, safeURL, safeURLs } from "./utils.ts";
+import * as path from "https://deno.land/std@0.176.0/path/mod.ts";
+
+// Create a script on disk
+export async function createScript(code: string) {
+  const scriptId = crypto.randomUUID();
+  const scriptPath = `./scripts/${scriptId}.ts`;
+  await Deno.writeTextFile(scriptPath, code);
+  return { scriptId, scriptPath: path.resolve(scriptPath) };
+}
+
+export const safeURLs = [
+  
+];
+
+// Check if an URL is known and safe
+export function safeURL(url: string) {
+  // for (let i = 0; i < safeURLs.length; i++) {
+  //   if (url.slice(0, safeURLs[i].length) === safeURLs[i]) {
+  //     return true;
+  //   }
+  // }
+
+  return true;
+}
+
 
 // Sandboxed scripts are only allowed to reach the internet via
 // this proxy (enforced via --allow-net).
@@ -21,6 +45,7 @@ const inFlightScriptIds: Record<string, number> = {};
 const SCRIPT_ROUTE = new URLPattern({ pathname: "/script" });
 const PROXY_ROUTE = new URLPattern({ pathname: "/proxy" });
 
+
 async function handler(req: Request) {
   if (SCRIPT_ROUTE.exec(req.url)) {
     // TODO: stop users sending gigabytes of source code
@@ -28,16 +53,49 @@ async function handler(req: Request) {
     const { scriptId, scriptPath } = await createScript(code);
     inFlightScriptIds[scriptId] = SCRIPT_REQUEST_LIMIT;
 
-    const cmd = [
-      "deno",
-      "run",
-      `--v8-flags=--max-old-space-size=${SCRIPT_MEMORY_LIMIT}`,
-      `--allow-read=${scriptPath}`,
-      `--allow-net=${PROXY_LOCATION}`,
-      "./sandbox.ts",
-      `scriptId=${scriptId}`,
-      `scriptPath=${scriptPath}`,
-    ];
+    const sandboxCode = `
+    const scriptId = "${scriptId}";
+    const scriptPath = "${scriptPath}";
+    const scriptProxy = "http://localhost:3001/proxy";
+    const scriptAuthHeaders = {
+      "x-script-id": scriptId,
+    };
+
+    const realFetch = fetch;
+
+    globalThis.fetch = (
+      input: string | Request | URL,
+      init?: RequestInit | undefined,
+    ) => {
+      if (init === undefined) {
+        init = {};
+      }
+
+      init.headers = {
+        ...init.headers,
+        ...scriptAuthHeaders,
+        "x-script-fetch": input.toString(),
+      };
+      return realFetch(scriptProxy, init);
+    };
+
+    try {
+      await import(scriptPath);
+    } catch (e) {
+      console.error(e);
+    }
+`;
+
+const sandboxPath = await createScript(sandboxCode);
+
+const cmd = [
+  "deno",
+  "run",
+  `--v8-flags=--max-old-space-size=${SCRIPT_MEMORY_LIMIT}`,
+  `--allow-read=${scriptPath},${sandboxPath.scriptPath}`,
+  `--allow-net=${PROXY_LOCATION}`,
+  sandboxPath.scriptPath,
+];
 
     const release = await conurrencyMutex.acquire();
     const scriptProcess = Deno.run({ cmd, stderr: "piped", stdout: "piped" });
